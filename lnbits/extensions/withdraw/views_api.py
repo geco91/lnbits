@@ -30,7 +30,7 @@ def api_lnurlencode(urlstr, parstr):
 
     url = url_for("withdraw.api_lnurlfetch", _external=True, urlstr=urlstr, parstr=parstr, rand=rand)
 
-    return jsonify({"status": "TRUE", "lnurl": lnurl_encode(url.replace("http", "https"))}), 200
+    return jsonify({"status": "TRUE", "lnurl": lnurl_encode(url.replace("http:", "https:"))}), 200
 
 
 @withdraw_ext.route("/api/v1/lnurlfetch/<urlstr>/<parstr>/<rand>", methods=["GET"])
@@ -49,7 +49,7 @@ def api_lnurlfetch(parstr, urlstr, rand):
         withdraw_ext_db.execute("UPDATE withdraws SET withdrawals = ? WHERE uni = ?", (k1str, parstr,))
 
     res = LnurlWithdrawResponse(
-        callback=url_for("withdraw.api_lnurlwithdraw", _external=True, rand=rand).replace("http", "https"),
+        callback=url_for("withdraw.api_lnurlwithdraw", _external=True, rand=rand).replace("http:", "https:"),
         k1=k1str,
         min_withdrawable=user_fau[0][8] * 1000,
         max_withdrawable=user_fau[0][7] * 1000,
@@ -91,7 +91,6 @@ def api_lnurlwithdraw(rand):
 
         randar = user_fau[0][15].split(",")
         if rand not in randar:
-            print("huhhh")
             return jsonify({"status": "ERROR", "reason": "BAD AUTH"}), 400
         if len(randar) > 2:
             randar.remove(rand)
