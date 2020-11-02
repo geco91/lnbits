@@ -11,8 +11,9 @@ __pycache__
 *.egg-info
 .coverage
 .pytest_cache
+.webassets-cache
 htmlcov
-Pipfile.lock
+test-reports
 
 *.swo
 *.swp
@@ -20,8 +21,13 @@ Pipfile.lock
 *.pyc
 *.env
 .env
+.venv
 venv
 
-database.sqlite3
-database.sqlite3*
+*.sqlite3
 .pyre*
+
+__bundle__
+
+node_modules
+lnbits/static/bundle.*

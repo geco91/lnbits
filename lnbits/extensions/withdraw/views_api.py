@@ -1,124 +1,202 @@
-import uuid
-import json
-import requests
-
-from flask import jsonify, request, url_for
-from lnurl import LnurlWithdrawResponse, encode as lnurl_encode
 from datetime import datetime
+from quart import g, jsonify, request
+from http import HTTPStatus
+from lnurl.exceptions import InvalidUrl as LnurlInvalidUrl
+import shortuuid  # type: ignore
 
-from lnbits.db import open_ext_db
+from lnbits.core.crud import get_user
+from lnbits.core.services import pay_invoice
+from lnbits.decorators import api_check_wallet_key, api_validate_post_request
+
 from lnbits.extensions.withdraw import withdraw_ext
+from .crud import (
+    create_withdraw_link,
+    get_withdraw_link,
+    get_withdraw_link_by_hash,
+    get_withdraw_links,
+    update_withdraw_link,
+    delete_withdraw_link,
+)
 
 
-@withdraw_ext.route("/api/v1/lnurlencode/<urlstr>/<parstr>", methods=["GET"])
-def api_lnurlencode(urlstr, parstr):
-    """Returns encoded LNURL if web url and parameter gieven."""
+@withdraw_ext.route("/api/v1/links", methods=["GET"])
+@api_check_wallet_key("invoice")
+async def api_links():
+    wallet_ids = [g.wallet.id]
 
-    if not urlstr:
-        return jsonify({"status": "FALSE"}), 200
-
-    with open_ext_db("withdraw") as withdraw_ext_db:
-        user_fau = withdraw_ext_db.fetchall("SELECT * FROM withdraws WHERE uni = ?", (parstr,))
-        randar = user_fau[0][15].split(",")
-        print(randar)
-        # randar = randar[:-1]
-        # If "Unique links" selected get correct rand, if not there is only one rand
-        if user_fau[0][12] > 0:
-            rand = randar[user_fau[0][10] - 1]
-        else:
-            rand = randar[0]
-
-
-    url = url_for("withdraw.api_lnurlfetch", _external=True, urlstr=urlstr, parstr=parstr, rand=rand)
-
-    return jsonify({"status": "TRUE", "lnurl": lnurl_encode(url.replace("http", "https"))}), 200
-
-
-@withdraw_ext.route("/api/v1/lnurlfetch/<urlstr>/<parstr>/<rand>", methods=["GET"])
-def api_lnurlfetch(parstr, urlstr, rand):
-    """Returns LNURL json."""
-
-    if not parstr:
-        return jsonify({"status": "FALSE", "ERROR": "NO WALL ID"}), 200
-
-    if not urlstr:
-
-        return jsonify({"status": "FALSE", "ERROR": "NO URL"}), 200
-
-    with open_ext_db("withdraw") as withdraw_ext_db:
-        user_fau = withdraw_ext_db.fetchall("SELECT * FROM withdraws WHERE uni = ?", (parstr,))
-        k1str = uuid.uuid4().hex
-        withdraw_ext_db.execute("UPDATE withdraws SET withdrawals = ? WHERE uni = ?", (k1str, parstr,))
-
-    res = LnurlWithdrawResponse(
-        callback=url_for("withdraw.api_lnurlwithdraw", _external=True, rand=rand).replace("http", "https"),
-        k1=k1str,
-        min_withdrawable=user_fau[0][8] * 1000,
-        max_withdrawable=user_fau[0][7] * 1000,
-        default_description="LNbits LNURL withdraw",
-    )
-
-
-    return res.json(), 200
-
-
-@withdraw_ext.route("/api/v1/lnurlwithdraw/<rand>/", methods=["GET"])
-def api_lnurlwithdraw(rand):
-    """Pays invoice if passed k1 invoice and rand."""
-
-    k1 = request.args.get("k1")
-    pr = request.args.get("pr")
-
-    if not k1:
-        return jsonify({"status": "FALSE", "ERROR": "NO k1"}), 200
-
-    if not pr:
-        return jsonify({"status": "FALSE", "ERROR": "NO PR"}), 200
-
-    with open_ext_db("withdraw") as withdraw_ext_db:
-        user_fau = withdraw_ext_db.fetchall("SELECT * FROM withdraws WHERE withdrawals = ?", (k1,))
-
-        if not user_fau:
-          
-            return jsonify({"status": "ERROR", "reason": "NO AUTH"}), 400
-
-        if user_fau[0][10] < 1:
-            
-            return jsonify({"status": "ERROR", "reason": "withdraw SPENT"}), 400
-
-        # Check withdraw time
-        dt = datetime.now()
-        seconds = dt.timestamp()
-        secspast = seconds - user_fau[0][14]
-
-        if secspast < user_fau[0][11]:
-            return jsonify({"status": "ERROR", "reason": "WAIT " + str(int(user_fau[0][11] - secspast)) + "s"}), 400
-
-        randar = user_fau[0][15].split(",")
-        if rand not in randar:
-            print("huhhh")
-            return jsonify({"status": "ERROR", "reason": "BAD AUTH"}), 400
-        if len(randar) > 2:
-            randar.remove(rand)
-        randstr = ",".join(randar)
-
-        # Update time and increments
-        upinc = int(user_fau[0][10]) - 1
-        withdraw_ext_db.execute(
-            "UPDATE withdraws SET inc = ?, rand = ?, tmestmp = ? WHERE withdrawals = ?", (upinc, randstr, seconds, k1,)
+    if "all_wallets" in request.args:
+        wallet_ids = get_user(g.wallet.user).wallet_ids
+    try:
+        return (
+            jsonify([{**link._asdict(), **{"lnurl": link.lnurl}} for link in get_withdraw_links(wallet_ids)]),
+            HTTPStatus.OK,
+        )
+    except LnurlInvalidUrl:
+        return (
+            jsonify({"message": "LNURLs need to be delivered over a publically accessible `https` domain or Tor."}),
+            HTTPStatus.UPGRADE_REQUIRED,
         )
 
-    header = {"Content-Type": "application/json", "Grpc-Metadata-macaroon": str(user_fau[0][4])}
-    data = {"payment_request": pr}
-    #this works locally but not being served over host, bug, needs fixing
-    #r = requests.post(url="https://lnbits.com/api/v1/channels/transactions", headers=header, data=json.dumps(data))
-    r = requests.post(url=url_for("api_transactions", _external=True), headers=header, data=json.dumps(data))
-    r_json = r.json()
 
-    if "ERROR" in r_json:
-        return jsonify({"status": "ERROR", "reason": r_json["ERROR"]}), 400
+@withdraw_ext.route("/api/v1/links/<link_id>", methods=["GET"])
+@api_check_wallet_key("invoice")
+async def api_link_retrieve(link_id):
+    link = get_withdraw_link(link_id, 0)
 
-    with open_ext_db("withdraw") as withdraw_ext_db:
-        user_fau = withdraw_ext_db.fetchall("SELECT * FROM withdraws WHERE withdrawals = ?", (k1,))
+    if not link:
+        return jsonify({"message": "Withdraw link does not exist."}), HTTPStatus.NOT_FOUND
 
-    return jsonify({"status": "OK"}), 200
+    if link.wallet != g.wallet.id:
+        return jsonify({"message": "Not your withdraw link."}), HTTPStatus.FORBIDDEN
+
+    return jsonify({**link._asdict(), **{"lnurl": link.lnurl}}), HTTPStatus.OK
+
+
+@withdraw_ext.route("/api/v1/links", methods=["POST"])
+@withdraw_ext.route("/api/v1/links/<link_id>", methods=["PUT"])
+@api_check_wallet_key("admin")
+@api_validate_post_request(
+    schema={
+        "title": {"type": "string", "empty": False, "required": True},
+        "min_withdrawable": {"type": "integer", "min": 1, "required": True},
+        "max_withdrawable": {"type": "integer", "min": 1, "required": True},
+        "uses": {"type": "integer", "min": 1, "required": True},
+        "wait_time": {"type": "integer", "min": 1, "required": True},
+        "is_unique": {"type": "boolean", "required": True},
+    }
+)
+async def api_link_create_or_update(link_id=None):
+    if g.data["max_withdrawable"] < g.data["min_withdrawable"]:
+        return (
+            jsonify({"message": "`max_withdrawable` needs to be at least `min_withdrawable`."}),
+            HTTPStatus.BAD_REQUEST,
+        )
+    if (g.data["max_withdrawable"] * g.data["uses"] * 1000) > g.wallet.balance_msat:
+        return jsonify({"message": "Insufficient balance."}), HTTPStatus.FORBIDDEN
+    usescsv = ""
+    for i in range(g.data["uses"]):
+        if g.data["is_unique"]:
+            usescsv += "," + str(i + 1)
+        else:
+            usescsv += "," + str(1)
+    usescsv = usescsv[1:]
+
+    if link_id:
+        link = get_withdraw_link(link_id, 0)
+        if not link:
+            return jsonify({"message": "Withdraw link does not exist."}), HTTPStatus.NOT_FOUND
+        if link.wallet != g.wallet.id:
+            return jsonify({"message": "Not your withdraw link."}), HTTPStatus.FORBIDDEN
+        link = update_withdraw_link(link_id, **g.data, usescsv=usescsv, used=0)
+    else:
+        link = create_withdraw_link(wallet_id=g.wallet.id, **g.data, usescsv=usescsv)
+    return jsonify({**link._asdict(), **{"lnurl": link.lnurl}}), HTTPStatus.OK if link_id else HTTPStatus.CREATED
+
+
+@withdraw_ext.route("/api/v1/links/<link_id>", methods=["DELETE"])
+@api_check_wallet_key("admin")
+async def api_link_delete(link_id):
+    link = get_withdraw_link(link_id)
+
+    if not link:
+        return jsonify({"message": "Withdraw link does not exist."}), HTTPStatus.NOT_FOUND
+
+    if link.wallet != g.wallet.id:
+        return jsonify({"message": "Not your withdraw link."}), HTTPStatus.FORBIDDEN
+
+    delete_withdraw_link(link_id)
+
+    return "", HTTPStatus.NO_CONTENT
+
+
+# FOR LNURLs WHICH ARE NOT UNIQUE
+
+
+@withdraw_ext.route("/api/v1/lnurl/<unique_hash>", methods=["GET"])
+async def api_lnurl_response(unique_hash):
+    link = get_withdraw_link_by_hash(unique_hash)
+
+    if not link:
+        return jsonify({"status": "ERROR", "reason": "LNURL-withdraw not found."}), HTTPStatus.OK
+
+    if link.is_unique == 1:
+        return jsonify({"status": "ERROR", "reason": "LNURL-withdraw not found."}), HTTPStatus.OK
+    usescsv = ""
+    for x in range(1, link.uses - link.used):
+        usescsv += "," + str(1)
+    usescsv = usescsv[1:]
+    link = update_withdraw_link(link.id, used=link.used + 1, usescsv=usescsv)
+
+    return jsonify(link.lnurl_response.dict()), HTTPStatus.OK
+
+
+# FOR LNURLs WHICH ARE UNIQUE
+
+
+@withdraw_ext.route("/api/v1/lnurl/<unique_hash>/<id_unique_hash>", methods=["GET"])
+async def api_lnurl_multi_response(unique_hash, id_unique_hash):
+    link = get_withdraw_link_by_hash(unique_hash)
+
+    if not link:
+        return jsonify({"status": "ERROR", "reason": "LNURL-withdraw not found."}), HTTPStatus.OK
+    useslist = link.usescsv.split(",")
+    usescsv = ""
+    found = False
+    if link.is_unique == 0:
+        for x in range(link.uses - link.used):
+            usescsv += "," + str(1)
+    else:
+        for x in useslist:
+            tohash = link.id + link.unique_hash + str(x)
+            if id_unique_hash == shortuuid.uuid(name=tohash):
+                found = True
+            else:
+                usescsv += "," + x
+    if not found:
+        return jsonify({"status": "ERROR", "reason": "LNURL-withdraw not found."}), HTTPStatus.OK
+
+    usescsv = usescsv[1:]
+    link = update_withdraw_link(link.id, used=link.used + 1, usescsv=usescsv)
+    return jsonify(link.lnurl_response.dict()), HTTPStatus.OK
+
+
+@withdraw_ext.route("/api/v1/lnurl/cb/<unique_hash>", methods=["GET"])
+async def api_lnurl_callback(unique_hash):
+    link = get_withdraw_link_by_hash(unique_hash)
+    k1 = request.args.get("k1", type=str)
+    payment_request = request.args.get("pr", type=str)
+    now = int(datetime.now().timestamp())
+
+    if not link:
+        return jsonify({"status": "ERROR", "reason": "LNURL-withdraw not found."}), HTTPStatus.OK
+
+    if link.is_spent:
+        return jsonify({"status": "ERROR", "reason": "Withdraw is spent."}), HTTPStatus.OK
+
+    if link.k1 != k1:
+        return jsonify({"status": "ERROR", "reason": "Bad request."}), HTTPStatus.OK
+
+    if now < link.open_time:
+        return jsonify({"status": "ERROR", "reason": f"Wait {link.open_time - now} seconds."}), HTTPStatus.OK
+
+    try:
+        pay_invoice(
+            wallet_id=link.wallet,
+            payment_request=payment_request,
+            max_sat=link.max_withdrawable,
+            extra={"tag": "withdraw"},
+        )
+
+        changes = {
+            "open_time": link.wait_time + now,
+        }
+
+        update_withdraw_link(link.id, **changes)
+    except ValueError as e:
+        return jsonify({"status": "ERROR", "reason": str(e)}), HTTPStatus.OK
+    except PermissionError:
+        return jsonify({"status": "ERROR", "reason": "Withdraw link is empty."}), HTTPStatus.OK
+    except Exception as e:
+        return jsonify({"status": "ERROR", "reason": str(e)}), HTTPStatus.OK
+
+    return jsonify({"status": "OK"}), HTTPStatus.OK

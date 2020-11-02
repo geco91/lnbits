@@ -1,60 +1,133 @@
-from requests import post
+import trio  # type: ignore
+import json
+import httpx
+from os import getenv
+from typing import Optional, Dict, AsyncGenerator
 
-from .base import InvoiceResponse, PaymentResponse, TxStatus, Wallet
+from .base import StatusResponse, InvoiceResponse, PaymentResponse, PaymentStatus, Wallet
 
 
 class LntxbotWallet(Wallet):
     """https://github.com/fiatjaf/lntxbot/blob/master/api.go"""
 
-    def __init__(self, *, endpoint: str, admin_key: str, invoice_key: str):
+    def __init__(self):
+        endpoint = getenv("LNTXBOT_API_ENDPOINT")
         self.endpoint = endpoint[:-1] if endpoint.endswith("/") else endpoint
-        self.auth_admin = {"Authorization": f"Basic {admin_key}"}
-        self.auth_invoice = {"Authorization": f"Basic {invoice_key}"}
 
-    def create_invoice(self, amount: int, memo: str = "") -> InvoiceResponse:
-        payment_hash, payment_request = None, None
-        r = post(url=f"{self.endpoint}/addinvoice", headers=self.auth_invoice, json={"amt": str(amount), "memo": memo})
+        key = getenv("LNTXBOT_KEY") or getenv("LNTXBOT_ADMIN_KEY") or getenv("LNTXBOT_INVOICE_KEY")
+        self.auth = {"Authorization": f"Basic {key}"}
 
-        if r.ok:
+    def status(self) -> StatusResponse:
+        r = httpx.get(
+            f"{self.endpoint}/balance",
+            headers=self.auth,
+            timeout=40,
+        )
+        try:
             data = r.json()
-            payment_hash, payment_request = data["payment_hash"], data["pay_req"]
+        except:
+            return StatusResponse(f"Failed to connect to {self.endpoint}, got: '{r.text[:200]}...'", 0)
 
-        return InvoiceResponse(r, payment_hash, payment_request)
+        if data.get("error"):
+            return StatusResponse(data["message"], 0)
 
-    def pay_invoice(self, bolt11: str) -> PaymentResponse:
-        r = post(url=f"{self.endpoint}/payinvoice", headers=self.auth_admin, json={"invoice": bolt11})
-        failed, fee_msat = not r.ok, 0
+        return StatusResponse(None, data["BTC"]["AvailableBalance"] * 1000)
 
-        if r.ok:
-            data = r.json()
-            if "error" in data and data["error"]:
-                failed = True
-            elif "fee_msat" in data:
-                fee_msat = data["fee_msat"]
+    def create_invoice(
+        self, amount: int, memo: Optional[str] = None, description_hash: Optional[bytes] = None
+    ) -> InvoiceResponse:
+        data: Dict = {"amt": str(amount)}
+        if description_hash:
+            data["description_hash"] = description_hash.hex()
+        else:
+            data["memo"] = memo or ""
 
-        return PaymentResponse(r, failed, fee_msat)
+        r = httpx.post(
+            f"{self.endpoint}/addinvoice",
+            headers=self.auth,
+            json=data,
+            timeout=40,
+        )
 
-    def get_invoice_status(self, payment_hash: str, wait: bool = True) -> TxStatus:
-        wait = "true" if wait else "false"
-        r = post(url=f"{self.endpoint}/invoicestatus/{payment_hash}?wait={wait}", headers=self.auth_invoice)
+        if r.is_error:
+            try:
+                data = r.json()
+                error_message = data["message"]
+            except:
+                error_message = r.text
+                pass
 
-        if not r.ok:
-            return TxStatus(r, None)
+            return InvoiceResponse(False, None, None, error_message)
 
         data = r.json()
+        return InvoiceResponse(True, data["payment_hash"], data["pay_req"], None)
 
-        if "error" in data:
-            return TxStatus(r, None)
+    def pay_invoice(self, bolt11: str) -> PaymentResponse:
+        r = httpx.post(
+            f"{self.endpoint}/payinvoice",
+            headers=self.auth,
+            json={"invoice": bolt11},
+            timeout=40,
+        )
 
-        if "preimage" not in data or not data["preimage"]:
-            return TxStatus(r, False)
+        if r.is_error:
+            try:
+                data = r.json()
+                error_message = data["message"]
+            except:
+                error_message = r.text
+                pass
 
-        return TxStatus(r, True)
+            return PaymentResponse(False, None, 0, None, error_message)
 
-    def get_payment_status(self, payment_hash: str) -> TxStatus:
-        r = post(url=f"{self.endpoint}/paymentstatus/{payment_hash}", headers=self.auth_invoice)
+        data = r.json()
+        checking_id = data["payment_hash"]
+        fee_msat = data["fee_msat"]
+        preimage = data["payment_preimage"]
+        return PaymentResponse(True, checking_id, fee_msat, preimage, None)
 
-        if not r.ok or "error" in r.json():
-            return TxStatus(r, None)
+    def get_invoice_status(self, checking_id: str) -> PaymentStatus:
+        r = httpx.post(
+            f"{self.endpoint}/invoicestatus/{checking_id}?wait=false",
+            headers=self.auth,
+        )
 
-        return TxStatus(r, {"complete": True, "failed": False, "unknown": None}[r.json().get("status", "unknown")])
+        data = r.json()
+        if r.is_error or "error" in data:
+            return PaymentStatus(None)
+
+        if "preimage" not in data:
+            return PaymentStatus(False)
+
+        return PaymentStatus(True)
+
+    def get_payment_status(self, checking_id: str) -> PaymentStatus:
+        r = httpx.post(
+            url=f"{self.endpoint}/paymentstatus/{checking_id}",
+            headers=self.auth,
+        )
+
+        data = r.json()
+        if r.is_error or "error" in data:
+            return PaymentStatus(None)
+
+        statuses = {"complete": True, "failed": False, "pending": None, "unknown": None}
+        return PaymentStatus(statuses[data.get("status", "unknown")])
+
+    async def paid_invoices_stream(self) -> AsyncGenerator[str, None]:
+        url = f"{self.endpoint}/payments/stream"
+
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=None, headers=self.auth) as client:
+                    async with client.stream("GET", url) as r:
+                        async for line in r.aiter_lines():
+                            if line.startswith("data:"):
+                                data = json.loads(line[5:])
+                                if "payment_hash" in data and data.get("msatoshi") > 0:
+                                    yield data["payment_hash"]
+            except (OSError, httpx.ReadError):
+                pass
+
+            print("lost connection to lntxbot /payments/stream, retrying in 5 seconds")
+            await trio.sleep(5)

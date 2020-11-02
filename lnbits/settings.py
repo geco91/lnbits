@@ -1,15 +1,35 @@
-import os
+import subprocess
+import importlib
 
-from .wallets import OpenNodeWallet  # OR LndWallet OR OpennodeWallet
- 
-WALLET = OpenNodeWallet(endpoint=os.getenv("OPENNODE_API_ENDPOINT"),admin_key=os.getenv("OPENNODE_ADMIN_KEY"),invoice_key=os.getenv("OPENNODE_INVOICE_KEY"))
-#WALLET = LntxbotWallet(endpoint=os.getenv("LNTXBOT_API_ENDPOINT"),admin_key=os.getenv("LNTXBOT_ADMIN_KEY"),invoice_key=os.getenv("LNTXBOT_INVOICE_KEY"))
-#WALLET = LndWallet(endpoint=os.getenv("LND_API_ENDPOINT"),admin_macaroon=os.getenv("LND_ADMIN_MACAROON"),invoice_macaroon=os.getenv("LND_INVOICE_MACAROON"),read_macaroon=os.getenv("LND_READ_MACAROON"))
-#WALLET = LNPayWallet(endpoint=os.getenv("LNPAY_API_ENDPOINT"),admin_key=os.getenv("LNPAY_ADMIN_KEY"),invoice_key=os.getenv("LNPAY_INVOICE_KEY"),api_key=os.getenv("LNPAY_API_KEY"),read_key=os.getenv("LNPAY_READ_KEY"))
+from environs import Env  # type: ignore
+from os import path
+from typing import List
 
 
-LNBITS_PATH = os.path.dirname(os.path.realpath(__file__))
-DATABASE_PATH = os.getenv("DATABASE_PATH", os.path.join(LNBITS_PATH, "data", "database.sqlite3"))
+env = Env()
+env.read_env()
 
-DEFAULT_USER_WALLET_NAME = os.getenv("DEFAULT_USER_WALLET_NAME", "Bitcoin LN Wallet")
-FEE_RESERVE = float(os.getenv("FEE_RESERVE", 0))
+wallets_module = importlib.import_module("lnbits.wallets")
+wallet_class = getattr(wallets_module, env.str("LNBITS_BACKEND_WALLET_CLASS", default="VoidWallet"))
+
+ENV = env.str("QUART_ENV", default="production")
+DEBUG = env.bool("QUART_DEBUG", default=False) or ENV == "development"
+HOST = env.str("HOST", default="127.0.0.1")
+PORT = env.int("PORT", default=5000)
+
+LNBITS_PATH = path.dirname(path.realpath(__file__))
+LNBITS_DATA_FOLDER = env.str("LNBITS_DATA_FOLDER", default=path.join(LNBITS_PATH, "data"))
+LNBITS_ALLOWED_USERS: List[str] = env.list("LNBITS_ALLOWED_USERS", default=[], subcast=str)
+LNBITS_DISABLED_EXTENSIONS: List[str] = env.list("LNBITS_DISABLED_EXTENSIONS", default=[], subcast=str)
+LNBITS_SITE_TITLE = env.str("LNBITS_SITE_TITLE", default="LNbits")
+
+WALLET = wallet_class()
+DEFAULT_WALLET_NAME = env.str("LNBITS_DEFAULT_WALLET_NAME", default="LNbits wallet")
+PREFER_SECURE_URLS = env.bool("LNBITS_FORCE_HTTPS", default=True)
+
+SERVICE_FEE = env.float("LNBITS_SERVICE_FEE", default=0.0)
+
+try:
+    LNBITS_COMMIT = subprocess.check_output(["git", "-C", LNBITS_PATH, "rev-parse", "HEAD"]).strip().decode("ascii")
+except:
+    LNBITS_COMMIT = "unknown"

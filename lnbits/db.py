@@ -1,9 +1,7 @@
 import os
 import sqlite3
 
-from typing import Optional
-
-from .settings import DATABASE_PATH, LNBITS_PATH
+from .settings import LNBITS_DATA_FOLDER
 
 
 class Database:
@@ -12,34 +10,57 @@ class Database:
         self.connection = sqlite3.connect(db_path)
         self.connection.row_factory = sqlite3.Row
         self.cursor = self.connection.cursor()
+        self.closed = False
+
+    def close(self):
+        self.__exit__(None, None, None)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cursor.close()
-        self.connection.close()
+        if self.closed:
+            return
 
-    def fetchall(self, query: str, values: tuple) -> list:
-        """Given a query, return cursor.fetchall() rows."""
-        self.cursor.execute(query, values)
-        return self.cursor.fetchall()
+        if exc_val:
+            self.connection.rollback()
+            self.cursor.close()
+            self.connection.close()
+        else:
+            self.connection.commit()
+            self.cursor.close()
+            self.connection.close()
 
-    def fetchone(self, query: str, values: tuple):
-        self.cursor.execute(query, values)
-        return self.cursor.fetchone()
+        self.closed = True
 
-    def execute(self, query: str, values: tuple) -> None:
-        """Given a query, cursor.execute() it."""
-        self.cursor.execute(query, values)
+    def commit(self):
         self.connection.commit()
 
+    def rollback(self):
+        self.connection.rollback()
 
-def open_db(db_path: str = DATABASE_PATH) -> Database:
+    def fetchall(self, query: str, values: tuple = ()) -> list:
+        """Given a query, return cursor.fetchall() rows."""
+        self.execute(query, values)
+        return self.cursor.fetchall()
+
+    def fetchone(self, query: str, values: tuple = ()):
+        self.execute(query, values)
+        return self.cursor.fetchone()
+
+    def execute(self, query: str, values: tuple = ()) -> None:
+        """Given a query, cursor.execute() it."""
+        try:
+            self.cursor.execute(query, values)
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise exc
+
+
+def open_db(db_name: str = "database") -> Database:
+    db_path = os.path.join(LNBITS_DATA_FOLDER, f"{db_name}.sqlite3")
     return Database(db_path=db_path)
 
 
-def open_ext_db(extension: Optional[str] = None) -> Database:
-    if extension:
-        return open_db(os.path.join(LNBITS_PATH, "extensions", extension, "database.sqlite3"))
-    return open_db(os.path.join(LNBITS_PATH, "extensions", "overview.sqlite3"))
+def open_ext_db(extension_name: str) -> Database:
+    return open_db(f"ext_{extension_name}")
